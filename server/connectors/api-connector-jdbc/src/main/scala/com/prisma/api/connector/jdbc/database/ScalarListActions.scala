@@ -2,114 +2,82 @@ package com.prisma.api.connector.jdbc.database
 
 import java.sql.PreparedStatement
 
-import com.prisma.api.connector.Filter
+import com.prisma.api.connector.{Filter, QueryArguments, SelectedFields}
 import com.prisma.gc_values.{IdGCValue, ListGCValue}
 import com.prisma.shared.models.{Model, ScalarField}
 import slick.dbio.DBIOAction
-import slick.jdbc.{JdbcBackend, PositionedParameters}
 
-trait ScalarListActions extends BuilderBase with FilterConditionBuilder {
+trait ScalarListActions extends BuilderBase with FilterConditionBuilder with NodeManyQueries {
   import slickDatabase.profile.api._
-
-  def deleteScalarListValuesByNodeIds(model: Model, ids: Vector[IdGCValue]): DBIO[Unit] = {
-    val actions = model.scalarListFields.map { listField =>
-      val query = sql
-        .deleteFrom(scalarListTable(listField))
-        .where(scalarListColumn(listField, "nodeId").in(placeHolders(ids)))
-
-      deleteToDBIO(query)(
-        setParams = pp => ids.foreach(pp.setGcValue)
-      )
-    }
-    DBIO.seq(actions: _*)
-  }
 
   def createScalarListValuesForNodeId(model: Model, id: IdGCValue, listFieldMap: Vector[(String, ListGCValue)]): DBIO[Unit] = {
     if (listFieldMap.isEmpty) {
-      return DBIOAction.successful(())
+      DBIOAction.successful(())
+    } else {
+      val actions = listFieldMap.map {
+        case (fieldName, listGCValue) =>
+          val scalarField = model.getScalarFieldByName_!(fieldName)
+          insertListValueForIds(scalarField, listGCValue, Vector(id))
+      }
+      DBIO.seq(actions: _*)
     }
 
-    setScalarListValues(model, listFieldMap, Vector(id))
-    createScalarListValues(model, listFieldMap, Vector(id))
   }
 
   def updateScalarListValuesForNodeId(model: Model, id: IdGCValue, listFieldMap: Vector[(String, ListGCValue)]): DBIO[Unit] = {
     if (listFieldMap.isEmpty) {
-      return DBIOAction.successful(())
+      DBIOAction.successful(())
+    } else {
+      updateScalarListValuesForIds(model, listFieldMap, Vector(id))
     }
 
-    setScalarListValues(model, listFieldMap, Vector(id))
   }
 
   def updateScalarListValuesByFilter(model: Model, listFieldMap: Vector[(String, ListGCValue)], whereFilter: Option[Filter]): DBIO[Unit] = {
     import scala.concurrent.ExecutionContext.Implicits.global
-
     if (listFieldMap.isEmpty) {
-      return DBIOAction.successful(())
+      DBIOAction.successful(())
+    } else {
+      for {
+        result <- getNodes(model, whereFilter.map(QueryArguments.withFilter), SelectedFields(model.idField_!))
+        ids    = result.nodes.map(_.id)
+        _      <- updateScalarListValuesForIds(model, listFieldMap, ids)
+      } yield ()
     }
+  }
 
-    val condition    = buildConditionForFilter(whereFilter)
-    val aliasedTable = modelTable(model).as(topLevelAlias)
+  def deleteScalarListValuesByNodeIds(model: Model, ids: Vector[IdGCValue]): DBIO[Unit] = {
+    val actions = model.scalarListFields.map(deleteListValuesForIds(_, ids))
+    DBIO.seq(actions: _*)
+  }
+
+  private def updateScalarListValuesForIds(model: Model, listFieldMap: Vector[(String, ListGCValue)], ids: Vector[IdGCValue]): DBIO[Unit] = {
+    if (ids.isEmpty) {
+      DBIOAction.successful(())
+    } else {
+      val actions = listFieldMap.map {
+        case (fieldName, listGCValue) =>
+          val scalarField = model.getScalarFieldByName_!(fieldName)
+          DBIO.seq(
+            deleteListValuesForIds(scalarField, ids),
+            insertListValueForIds(scalarField, listGCValue, ids)
+          )
+      }
+      DBIO.seq(actions: _*)
+    }
+  }
+
+  private def deleteListValuesForIds(listField: ScalarField, ids: Vector[IdGCValue]): DBIO[Unit] = {
     val query = sql
-      .select(aliasColumn(model.idField_!))
-      .from(aliasedTable)
-      .where(condition)
+      .deleteFrom(scalarListTable(listField))
+      .where(scalarListColumn(listField, nodeIdFieldName).in(placeHolders(ids)))
 
-    val idQuery = queryToDBIO(query)(
-      setParams = pp => SetParams.setFilter(pp, whereFilter),
-      readResult = rs => rs.readWith(readNodeId(model))
+    deleteToDBIO(query)(
+      setParams = pp => ids.foreach(pp.setGcValue)
     )
-
-    for {
-      ids <- idQuery
-      _   <- setScalarListValues(model, listFieldMap, ids)
-    } yield ()
   }
 
-  private def createScalarListValues(model: Model, listFieldMap: Vector[(String, ListGCValue)], ids: Vector[IdGCValue]): DBIO[Unit] = {
-    if (ids.isEmpty) {
-      return DBIOAction.successful(())
-    }
-
-    SimpleDBIO[Unit] { ctx =>
-      listFieldMap.foreach {
-        case (fieldName, listGCValue) =>
-          val scalarField = model.getScalarFieldByName_!(fieldName)
-          insertListValueForIds(scalarField, listGCValue, ids, ctx)
-      }
-    }
-  }
-
-  private def setScalarListValues(model: Model, listFieldMap: Vector[(String, ListGCValue)], ids: Vector[IdGCValue]): DBIO[Unit] = {
-    if (ids.isEmpty) {
-      return DBIOAction.successful(())
-    }
-
-    SimpleDBIO[Unit] { ctx =>
-      listFieldMap.foreach {
-        case (fieldName, listGCValue) =>
-          val scalarField = model.getScalarFieldByName_!(fieldName)
-          deleteListValuesForIds(scalarField, ids, ctx)
-          insertListValueForIds(scalarField, listGCValue, ids, ctx)
-      }
-    }
-  }
-
-  private def deleteListValuesForIds(scalarField: ScalarField, ids: Vector[IdGCValue], ctx: JdbcBackend#JdbcActionContext) = {
-    val table = scalarListTable(scalarField)
-    val wipe = sql
-      .deleteFrom(table)
-      .where(scalarListColumn(scalarField, nodeIdFieldName).in(placeHolders(ids)))
-      .getSQL
-
-    val wipeOldValues: PreparedStatement = ctx.connection.prepareStatement(wipe)
-    val pp                               = new PositionedParameters(wipeOldValues)
-    ids.foreach(pp.setGcValue)
-
-    wipeOldValues.executeUpdate()
-  }
-
-  private def insertListValueForIds(scalarField: ScalarField, value: ListGCValue, ids: Vector[IdGCValue], ctx: JdbcBackend#JdbcActionContext) = {
+  private def insertListValueForIds(scalarField: ScalarField, value: ListGCValue, ids: Vector[IdGCValue]) = SimpleDBIO[Unit] { ctx =>
     val table = scalarListTable(scalarField)
     val insert = sql
       .insertInto(table)

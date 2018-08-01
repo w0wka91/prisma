@@ -58,7 +58,8 @@ object QueryArguments {
 }
 
 object SelectedFields {
-  def all(model: Model) = SelectedFields(model.fields.toSet)
+  def all(model: Model)                   = SelectedFields(model.fields.toSet)
+  def apply(field: Field): SelectedFields = SelectedFields(Set(field))
 }
 case class SelectedFields(fields: Set[Field]) {
   val scalarListFields    = fields.collect { case f: ScalarField if f.isList  => f }
